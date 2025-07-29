@@ -1,0 +1,138 @@
+@import url('./default.css');
+@import url('./variables.css');
+
+body {
+    background-color: var(--color-primary-deep);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--spacing-md);
+    width: 100dvw;
+    height: 100dvh;
+    padding: 10px;
+    font-family: var(--font-family-base);
+}
+
+.logo-container {
+    margin-top: 3rem;
+}
+
+.logo-img {
+    width: 5.6rem;
+    height: 5.6rem;
+    border: 1px solid var(--color-neutral-base);
+    border-radius: 100%;
+    object-fit: contain;
+    filter: drop-shadow(0 0 10px #0004ff);
+}
+
+.error-card {
+    background-color: var(--color-error-base);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    width: 100%;
+    max-width: 300px;
+    min-width: 0;
+    padding: .6rem .8rem;
+    border: 1.5px solid var(--color-error-light);
+    border-radius: .3rem;
+    font-size: .7rem;
+    color: var(--color-white-base);
+    opacity: 1;
+    transform: translateY(0);
+    transition: opacity var(--transition-duration-fast) var(--transition-easing-default), transform var(--transition-duration-fast) var(--transition-easing-default);
+}
+
+.error-card.hide {
+    opacity: 0;
+    transform: translateY(-10px);
+    pointer-events: none;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.error-button {
+    background-color: transparent;
+    font-size: .7rem;
+    color: var(--color-error-light);
+}
+
+.form {
+    background-color: var(--color-neutral-light);
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-md);
+    max-width: 300px;
+    width: 100%;
+    min-width: 0;
+    padding: 1.4rem 1rem;
+    border: 1.6px solid var(--color-neutral-base);
+    border-radius: .3rem;
+}
+
+.form__group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-sm);
+}
+
+.form__label {
+    font-size: var(--font-size-base);
+    color: var(--color-white-base);
+}
+
+.form__input {
+    background-color: transparent;
+    width: 100%;
+    height: 1.8rem;
+    padding: .3rem;
+    border: 1px solid var(--color-neutral-base);
+    border-radius: .3rem;
+    color: var(--color-white-base);
+}
+
+.form__input:focus {
+    background-color: transparent;
+}
+
+.form__row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    width: 100%;
+}
+
+.form__group:has(.form__reset-password) {
+    flex-flow: row wrap;
+}
+
+a {
+    text-wrap: nowrap;
+    text-decoration: none;
+}
+
+.form__reset-password {
+    font-size: .8rem;
+    color: var(--color-primary-light);
+}
+
+.form__submit-button {
+    background-color: #1D4ED8;
+    height: 1.8rem;
+    border-radius: .3rem;
+    color: #ffff;
+    cursor: pointer;
+    transition: background-color .1s ease-in-out,
+                transform .1s ease;
+}
+
+.form__submit-button:hover {
+    background-color: #2563EB;
+    transition: all .1s ease-in-out;
+}
+
+.form__submit-button:active {
+    background-color: #3B82F6;
+    transform: scale(0.97);
+    transition: all .1s ease-in-out;
+}
