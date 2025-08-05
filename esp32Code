@@ -1,0 +1,387 @@
+#include <WiFi.h>
+#include <DHT.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+const char  *piIp = "";
+const char *ssid = "";
+const char *psk = "";
+
+String url = String("http://") + piIp + "/api/sensor-data";
+#define DHT_PIN 27
+#define DHT_TYPE DHT22
+DHT dhtSensor(DHT_PIN, DHT_TYPE);
+
+class SensorTelemetry {
+  private:
+    char telemetryJsonBuffer[256];
+    float lastTemperature;
+    float lastHumidity;
+    DHT &sensor;
+
+  public:
+    SensorTelemetry(DHT &dht) : sensor(dht), lastTemperature(NAN), lastHumidity(NAN) {}
+
+    bool readSensor() {
+      float temperature = sensor.readTemperature();
+      float humidity = sensor.readHumidity();
+      if (isnan(temperature) || isnan(humidity)) return false;
+
+      lastTemperature = temperature;
+      lastHumidity = humidity;
+        Serial.print("🌡️ Temperature: ");
+        Serial.print(temperature);
+        Serial.print(" °C, 💧 Humidity: ");
+        Serial.print(humidity);
+        Serial.println(" %");
+
+      return true;
+    }
+
+    const char *generateTelemetryJson() {
+      StaticJsonDocument<200> doc;
+      doc["temperature"] = lastTemperature;
+      doc["humidity"] = lastHumidity;
+      serializeJson(doc, telemetryJsonBuffer, sizeof(telemetryJsonBuffer));
+      return telemetryJsonBuffer;
+    }
+};
+
+SensorTelemetry sensorTelemetry(dhtSensor);
+
+class ESPConfig {
+  public:
+    struct HttpConfig {
+      unsigned long intervalMs;
+      bool enabled;
+    };
+
+    struct MqttConfig {
+      bool enabled;
+      bool clientActive = false;
+      unsigned long lastClientSignal = 0;
+    };
+
+    struct SystemConfig {
+      bool restartRequested;
+    };
+
+  private:
+    HttpConfig httpConfig;
+    MqttConfig mqttConfig;
+    SystemConfig systemConfig;
+    char statusJsonBuffer[512];
+
+  public:
+    ESPConfig() {
+      httpConfig.intervalMs = 30000;
+      httpConfig.enabled = true;
+      mqttConfig.enabled = true;
+      systemConfig.restartRequested = false;
+    }
+
+    unsigned long getHttpInterval() { return httpConfig.intervalMs; }
+    void setHttpInterval(unsigned long interval) { httpConfig.intervalMs = interval; }
+    bool isHttpEnabled() { return httpConfig.enabled; }
+    void setHttpEnabled(bool enabled) { httpConfig.enabled = enabled; }
+
+    bool isMqttEnabled() { return mqttConfig.enabled; }
+    void setMqttEnabled(bool enabled) { mqttConfig.enabled = enabled; }
+
+    void requestRestart() { 
+      Serial.println("♻️ Restart requested via MQTT...");
+      ESP.restart();
+    }
+
+
+    bool isClientActive() {
+      return mqttConfig.clientActive;
+    }
+
+    void setClientActive(bool active) {
+      mqttConfig.clientActive = active;
+      if (active) {
+        mqttConfig.lastClientSignal = millis();
+        Serial.println("✅ Active client detected.");
+      }
+    }
+
+    void updateClientActivity() {
+      if (mqttConfig.clientActive && millis() - mqttConfig.lastClientSignal > 10000) {
+        mqttConfig.clientActive = false;
+        Serial.println("🛑 Inactive client. Stopping MQTT publishing.");
+      }
+    }
+
+    const char* getEsp32InfoJson() {
+      StaticJsonDocument<512> doc;
+      doc["ip_address"] = WiFi.localIP().toString();
+      doc["mac_address"] = WiFi.macAddress();
+      doc["hostname"] = WiFi.getHostname();
+      doc["is_enabled"] = httpConfig.enabled;
+      doc["request_interval_ms"] = httpConfig.intervalMs;
+
+      serializeJson(doc, statusJsonBuffer, sizeof(statusJsonBuffer));
+      return statusJsonBuffer;
+    }
+};
+
+ESPConfig globalConfig;
+
+class IMessageHandler {
+  public:
+    virtual void handleMessage(const String &topic, const String &payload) = 0;
+};
+
+class MqttClientESP {
+  private:
+    WiFiClient wifiClient;
+    PubSubClient mqttClient;
+    const char *mqttServer;
+    uint16_t mqttPort;
+    const char *clientId;
+    static MqttClientESP *instance;
+    IMessageHandler *handler;
+
+    static void mqttCallback(char *topic, byte *payload, unsigned int length) {
+      if (instance) instance->onMessageReceived(topic, payload, length);
+    }
+
+  public:
+    MqttClientESP(const char *server, uint16_t port, const char *id)
+      : mqttClient(wifiClient), mqttServer(server), mqttPort(port), clientId(id), handler(nullptr) {
+      instance = this;
+    }
+
+    void setup() {
+      mqttClient.setServer(mqttServer, mqttPort);
+      mqttClient.setCallback(mqttCallback);
+      mqttClient.setBufferSize(512);
+    }
+
+    void setHandler(IMessageHandler *h) { handler = h; }
+
+    void connect() {
+      if (!mqttClient.connected()) {
+        if (mqttClient.connect(clientId)) {
+          mqttClient.subscribe("esp32/001/commands");
+          Serial.println("✅ Connected to MQTT broker.");
+        }
+      }
+    }
+
+    void handle() { mqttClient.loop(); }
+
+    void publish(const char *topic, const char *payload) {
+      if (mqttClient.connected()) mqttClient.publish(topic, payload);
+    }
+
+    void onMessageReceived(char *topic, byte *payload, unsigned int length) {
+      String t = String(topic);
+      String msg;
+      for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+      if (handler) handler->handleMessage(t, msg);
+    }
+};
+
+MqttClientESP* MqttClientESP::instance = nullptr;
+MqttClientESP myMqttClient(piIp, 1883, "ESP32Client01");
+
+class IHttpHandler {
+  public:
+    virtual void handleResponse(const String &payload) = 0;
+};
+
+class HttpHandlerESP : public IHttpHandler {
+  public:
+    void handleResponse(const String& payload) override {
+      Serial.println("📨 HTTP response received:");
+      Serial.println(payload);
+    }
+};
+
+class HttpClientESP {
+  private:
+    IHttpHandler* handler;
+
+  public:
+    void setHandler(IHttpHandler* h) { handler = h; }
+
+    void sendPost(const char* url, const char* payload) {
+      if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(url);
+        http.addHeader("Content-Type", "application/json");
+        http.POST((uint8_t*)payload, strlen(payload));
+        String response = http.getString();
+        http.end();
+        if (handler) handler->handleResponse(response);
+      }
+    }
+};
+
+HttpClientESP myHttpClient;
+HttpHandlerESP myHttpHandler;
+
+class HttpTelemetrySender {
+  private:
+    unsigned long lastSendTime;
+    HttpClientESP *httpClient;
+    ESPConfig *config;
+
+  public:
+    HttpTelemetrySender(HttpClientESP *client, ESPConfig *cfg)
+      : httpClient(client), config(cfg), lastSendTime(0) {}
+
+    void trySend(const char *url, const char *jsonPayload) {
+      if (!config->isHttpEnabled()) return;
+
+      unsigned long interval = config->getHttpInterval();
+      if (millis() - lastSendTime >= interval) {
+        Serial.println("🚀 Sending POST request");
+        httpClient->sendPost(url, jsonPayload);
+        lastSendTime = millis();
+      }
+    }
+};
+
+class MqttTelemetrySender {
+  private:
+    unsigned long lastSendTime;
+    MqttClientESP *mqttClient;
+    ESPConfig *config;
+    unsigned long interval;
+
+  public:
+    MqttTelemetrySender(MqttClientESP *client, ESPConfig *cfg, unsigned long intervalMs)
+      : mqttClient(client), config(cfg), interval(intervalMs), lastSendTime(0) {}
+
+    void tryPublish(const char *topic, const char *jsonPayload) {
+      if (!config->isMqttEnabled()) return;
+      if (!config->isClientActive()) return;
+
+      if (millis() - lastSendTime >= interval) {
+        mqttClient->publish(topic, jsonPayload);
+        Serial.println("📤 MQTT telemetry sent.");
+        lastSendTime = millis();
+      }
+    }
+    void tryPublishData(const char *topic, const char *jsonPayload) {
+        Serial.println("Publication on:");
+        Serial.println(topic);
+        Serial.println(jsonPayload);
+        mqttClient->publish(topic, jsonPayload);
+        Serial.println("📡 ESP32 information sent.");
+    }
+};
+
+HttpTelemetrySender myHttpSender(&myHttpClient, &globalConfig);
+MqttTelemetrySender myMqttSender(&myMqttClient, &globalConfig, 5000);
+
+class MessageHandlerESP : public IMessageHandler {
+  private:
+    ESPConfig* config;
+    MqttTelemetrySender* myMqttSender;
+
+  public:
+    MessageHandlerESP(ESPConfig* cfg, MqttTelemetrySender* sender)
+      : config(cfg), myMqttSender(sender) {}
+
+    void handleMessage(const String &topic, const String &payload) override {
+      
+      Serial.print("📩 Message received on ESP32 [");
+      Serial.print(topic);
+      Serial.println("]:");
+      Serial.println(payload);
+
+      if (topic == "esp32/001/commands") {
+        StaticJsonDocument<256> doc;
+        DeserializationError err = deserializeJson(doc, payload);
+        
+        if (err) {
+          Serial.print("❌ Error parsing JSON: ");
+          Serial.println(err.c_str());
+          return;
+        }
+
+        if (doc.containsKey("client_active")) {
+          config->setClientActive(doc["client_active"]);
+          Serial.println("🔄 client_active");
+        }
+
+        if (doc.containsKey("http_enabled")) {
+          config->setHttpEnabled(doc["http_enabled"]);
+          Serial.print("🛠️ http_enabled");
+          Serial.println((int)doc["http_enabled"]);
+        }
+
+        if (doc.containsKey("http_interval_ms")) {
+          config->setHttpInterval(doc["http_interval_ms"]);
+          Serial.print("🛠️ http_interval_ms");
+          Serial.println((int)doc["http_interval_ms"]);
+        } else if (doc.containsKey("http_interval")) {
+          config->setHttpInterval(doc["http_interval"]);
+          Serial.print("🛠️ http_interval");
+          Serial.println((int)doc["http_interval"]);
+        }
+
+        if (doc.containsKey("restart") && doc["restart"] == true) {
+          Serial.println("🔄 Restart request received.");
+          config->requestRestart();
+        }
+
+        if (doc.containsKey("get_status") && doc["get_status"] == true) {
+          const char* json = config->getEsp32InfoJson();
+          Serial.print("📏 Generated JSON length:");
+          Serial.println(strlen(json));
+          Serial.println("📤 Sending JSON:");
+          Serial.println(json);
+          myMqttSender->tryPublishData("esp32/001/status", json);
+          Serial.println("✅ Status sent.");
+        }
+      }
+    }
+
+};
+
+
+MessageHandlerESP myMessageHandler(&globalConfig, &myMqttSender);
+
+void setup() {
+  Serial.begin(115200);
+  dhtSensor.begin();
+  WiFi.begin(ssid, psk);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  Serial.println("✅ WiFi connected.");
+
+  myMqttClient.setHandler(&myMessageHandler);
+  myMqttClient.setup();
+  myMqttClient.connect();
+
+  myHttpClient.setHandler(&myHttpHandler);
+}
+
+unsigned long lastSensorRead = 0;
+const unsigned long sensorInterval = 2000;
+
+void loop() {
+  myMqttClient.connect();
+  myMqttClient.handle();
+
+  globalConfig.updateClientActivity();
+
+  unsigned long now = millis();
+  if (now - lastSensorRead >= sensorInterval) {
+    lastSensorRead = now;
+
+    if (sensorTelemetry.readSensor()) {
+      const char* json = sensorTelemetry.generateTelemetryJson();
+      myMqttSender.tryPublish("esp32/001/telemetry", json);
+      myHttpSender.trySend(url.c_str(), json);
+    } else {
+      Serial.println("❌ Error reading sensor.");
+    }
+  }
+
+}
